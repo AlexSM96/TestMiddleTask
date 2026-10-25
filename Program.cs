@@ -1,73 +1,102 @@
-using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.EntityFrameworkCore;
 using TestMiddleTask;
 using TestMiddleTask.Database;
 using TestMiddleTask.Database.Entities;
+using TestMiddleTask.Database.Exceptions;
+using TestMiddleTask.Database.Outbox;
 using TestMiddleTask.Database.Repositories;
 using TestMiddleTask.RabbitMq;
 
 var builder = WebApplication.CreateBuilder(args);
+
+var connectionString = builder.Configuration.GetConnectionString("TaskDb")
+    ?? throw new InvalidOperationException("Connection string 'TaskDb' is not configured.");
+
 builder.Services.AddOpenApi();
+builder.Services.AddProblemDetails();
 builder.Services
     .AddDbContext<TaskAppDbContext>(x =>
     {
-        var connectionString = builder.Configuration.GetConnectionString("TaskDb");
         x.UseNpgsql(connectionString);
     });
 
+builder.Services.Configure<RabbitMqOptions>(
+    builder.Configuration.GetSection(RabbitMqOptions.SectionName));
+builder.Services.Configure<OutboxOptions>(
+    builder.Configuration.GetSection(OutboxOptions.SectionName));
 
 builder.Services.AddScoped<ITaskDbRepository, TaskRepository>();
+builder.Services.AddSingleton<ITaskPublisher, TaskPublisher>();
+builder.Services.AddHostedService<OutboxPublisherBackgroundService>();
 
 var app = builder.Build();
+
+await using (var scope = app.Services.CreateAsyncScope())
+{
+    var dbContext = scope.ServiceProvider.GetRequiredService<TaskAppDbContext>();
+    await dbContext.Database.MigrateAsync();
+}
 
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
 }
 
-app.UseHttpsRedirection();
-
+app.UseExceptionHandler(new ExceptionHandlerOptions
+{
+    StatusCodeSelector = exception => exception is BadHttpRequestException badHttpRequestException
+        ? badHttpRequestException.StatusCode
+        : StatusCodes.Status500InternalServerError,
+});
 
 app.MapGet("/tasks", async (ITaskDbRepository repository, CancellationToken ct) =>
 {
     var tasks = await repository.GetTasks(ct);
-    return tasks;
+    return Results.Ok(tasks.Select(TaskItemResponse.FromEntity));
 });
 
-
 app.MapPost("/tasks", async (
-    [FromServices] ITaskDbRepository repository,
-    [FromBody] CreateTaskItemRequest createTaskItemRequest,
+    CreateTaskItemRequest createTaskItemRequest,
+    ITaskDbRepository repository,
     CancellationToken ct) =>
 {
-    try
-    {
-        if (string.IsNullOrWhiteSpace(createTaskItemRequest.Title) || createTaskItemRequest.Title.Length > 200)
-        {
-            return Results.BadRequest("Title is required, max length is 200 characters.");
-        }
+    var errors = new Dictionary<string, string[]>();
 
-        var createdTaskId = await repository.AddTask(new TaskItem
-        {
-            Id = Guid.NewGuid(),
-            Title = createTaskItemRequest.Title,
-            Priority = createTaskItemRequest.Priority,
-            CreatedAt = DateTimeOffset.UtcNow,
-        }, ct);
-
-        return Results.Ok(new { Id = createdTaskId });
-    }
-    catch (Exception ex)
+    if (string.IsNullOrWhiteSpace(createTaskItemRequest.Title))
     {
-        return Results.BadRequest(ex.Message);
+        errors[nameof(createTaskItemRequest.Title)] = new[] { "Title is required." };
     }
+    else if (createTaskItemRequest.Title.Length > 200)
+    {
+        errors[nameof(createTaskItemRequest.Title)] = new[] { "Title max length is 200 characters." };
+    }
+
+    if (!Enum.IsDefined(createTaskItemRequest.Priority))
+    {
+        errors[nameof(createTaskItemRequest.Priority)] = new[] { "Unknown priority value." };
+    }
+
+    if (errors.Count > 0)
+    {
+        return Results.ValidationProblem(errors);
+    }
+
+    var createdTaskId = await repository.AddTask(new TaskItem
+    {
+        Id = Guid.NewGuid(),
+        Title = createTaskItemRequest.Title,
+        Priority = createTaskItemRequest.Priority,
+        CreatedAt = DateTimeOffset.UtcNow,
+    }, ct);
+
+    return Results.Created($"/tasks/{createdTaskId}", new { Id = createdTaskId });
 });
 
 app.MapPut("/tasks/{id:guid}/complete", async (
-    [FromServices] ITaskDbRepository repository,
-    [FromServices] ITaskPublisher taskPublisher,
-    [FromServices] ILogger logger,
-    [FromQuery] Guid id,
+    Guid id,
+    ITaskDbRepository repository,
+    ILogger<Program> logger,
     CancellationToken ct) =>
 {
     try
@@ -78,45 +107,28 @@ app.MapPut("/tasks/{id:guid}/complete", async (
             return Results.NotFound();
         }
 
-        // TODO: плохо -> переделать на Outbox
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                taskPublisher.PublishAsync(completedTask, ct);
-            }
-            catch (Exception e)
-            {
-                logger.LogError($"Ошибка при отправке сообщения: {e.Message}");
-            }
-        }, ct);
-
         return Results.Ok(new { completedTask.Id });
     }
-    catch (DbUpdateConcurrencyException ex)
+    catch (TaskAlreadyCompletedException)
     {
-        return Results.Conflict("Кто-то уже завершает данную задачу");
+        return Results.Conflict("Задача уже завершена.");
     }
-    catch (Exception e)
+    catch (DbUpdateConcurrencyException exception)
     {
-        return Results.BadRequest(e.Message);
+        logger.LogWarning(exception, "Concurrency conflict while completing task {TaskId}", id);
+        return Results.Conflict("Кто-то уже завершает данную задачу");
     }
 });
 
 app.MapDelete("/tasks/{id:guid}", async (
-    [FromServices]ITaskDbRepository repository,
-    [FromQuery] Guid id,
+    Guid id,
+    ITaskDbRepository repository,
     CancellationToken ct) =>
 {
-    try
-    {
-        var count = await repository.DeleteTask(id, ct);
-        return Results.Ok(new { CountDeletedRow = count });
-    }
-    catch (Exception e)
-    {
-        return Results.BadRequest(e.Message);
-    }
+    var count = await repository.DeleteTask(id, ct);
+    return count == 0
+        ? Results.NotFound()
+        : Results.Ok(new { CountDeletedRow = count });
 });
 
 app.Run();

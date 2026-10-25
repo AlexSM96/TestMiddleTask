@@ -1,8 +1,8 @@
-﻿using TestMiddleTask.Database.Entities;
+﻿using TestMiddleTask.Contracts;
 
 namespace TestMiddleTask.RabbitMq;
 
 public interface ITaskPublisher
 {
-    public Task PublishAsync(TaskItem taskItem, CancellationToken ct);
+    public Task PublishAsync(TaskCompletedMessage message, CancellationToken ct);
 }

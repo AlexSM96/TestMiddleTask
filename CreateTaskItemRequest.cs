@@ -5,12 +5,13 @@ namespace TestMiddleTask;
 
 public class CreateTaskItemRequest
 {
+    [Required]
     [MaxLength(200)]
     public string Title { get; set; } = string.Empty;
-    
+
     [AllowedValues(
         Priority.Low,
         Priority.Medium,
         Priority.High)]
-    public Priority Priority { get; set; } =  Priority.Medium;
+    public Priority Priority { get; set; } = Priority.Medium;
 }

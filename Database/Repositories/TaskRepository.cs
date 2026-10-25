@@ -1,5 +1,8 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
+using TestMiddleTask.Contracts;
 using TestMiddleTask.Database.Entities;
+using TestMiddleTask.Database.Exceptions;
 
 namespace TestMiddleTask.Database.Repositories;
 
@@ -32,8 +35,29 @@ public class TaskRepository(TaskAppDbContext context) : ITaskDbRepository
             return null;
         }
 
+        if (taskToUpdate.IsCompleted)
+        {
+            throw new TaskAlreadyCompletedException(taskId);
+        }
+
+        var completedAt = DateTimeOffset.UtcNow;
         taskToUpdate.IsCompleted = true;
-        taskToUpdate.CompletedAt = DateTimeOffset.UtcNow;
+        taskToUpdate.CompletedAt = completedAt;
+
+        context.OutboxMessages.Add(new OutboxMessage
+        {
+            Id = Guid.NewGuid(),
+            Type = nameof(TaskCompletedMessage),
+            Payload = JsonSerializer.Serialize(new TaskCompletedMessage(
+                taskToUpdate.Id,
+                taskToUpdate.Title,
+                taskToUpdate.Priority,
+                taskToUpdate.CreatedAt,
+                completedAt)),
+            OccurredAt = completedAt,
+            NextAttemptAt = completedAt,
+        });
+
         await context.SaveChangesAsync(cancellationToken);
         
         return taskToUpdate;
