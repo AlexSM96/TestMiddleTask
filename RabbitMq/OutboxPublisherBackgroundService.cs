@@ -21,7 +21,7 @@ public sealed class OutboxPublisherBackgroundService(
         var pollingInterval = TimeSpan.FromSeconds(Math.Max(1, _options.PollingIntervalSeconds));
         using var timer = new PeriodicTimer(pollingInterval);
 
-        while (!await timer.WaitForNextTickAsync(stoppingToken))
+        while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
@@ -34,6 +34,15 @@ public sealed class OutboxPublisherBackgroundService(
             catch (Exception exception)
             {
                 logger.LogError(exception, "Error while processing outbox messages");
+            }
+
+            try
+            {
+                await timer.WaitForNextTickAsync(stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
             }
         }
     }
