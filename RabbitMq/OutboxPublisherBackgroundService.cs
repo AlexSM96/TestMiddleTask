@@ -21,7 +21,7 @@ public sealed class OutboxPublisherBackgroundService(
         var pollingInterval = TimeSpan.FromSeconds(Math.Max(1, _options.PollingIntervalSeconds));
         using var timer = new PeriodicTimer(pollingInterval);
 
-        while (!stoppingToken.IsCancellationRequested)
+        while (!await timer.WaitForNextTickAsync(stoppingToken))
         {
             try
             {
@@ -35,15 +35,6 @@ public sealed class OutboxPublisherBackgroundService(
             {
                 logger.LogError(exception, "Error while processing outbox messages");
             }
-
-            try
-            {
-                await timer.WaitForNextTickAsync(stoppingToken);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
         }
     }
 
@@ -51,18 +42,26 @@ public sealed class OutboxPublisherBackgroundService(
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<TaskAppDbContext>();
+        var batchSize = Math.Max(1, _options.BatchSize);
 
         while (!ct.IsCancellationRequested)
         {
+            await using var transaction = await dbContext.Database.BeginTransactionAsync(ct);
+
             var now = DateTimeOffset.UtcNow;
             var messages = await dbContext.OutboxMessages
-                .Where(x => x.ProcessedAt == null && x.NextAttemptAt <= now)
-                .OrderBy(x => x.OccurredAt)
-                .Take(Math.Max(1, _options.BatchSize))
+                .FromSql($"""
+                    SELECT * FROM "OutboxMessages"
+                    WHERE "ProcessedAt" IS NULL AND "NextAttemptAt" <= {now}
+                    ORDER BY "OccurredAt"
+                    LIMIT {batchSize}
+                    FOR UPDATE SKIP LOCKED
+                    """)
                 .ToListAsync(ct);
 
             if (messages.Count == 0)
             {
+                await transaction.CommitAsync(ct);
                 return;
             }
 
@@ -70,6 +69,8 @@ public sealed class OutboxPublisherBackgroundService(
             {
                 await PublishMessageAsync(dbContext, message, ct);
             }
+
+            await transaction.CommitAsync(ct);
         }
     }
 

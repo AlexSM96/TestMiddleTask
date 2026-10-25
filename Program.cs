@@ -27,6 +27,7 @@ builder.Services.Configure<OutboxOptions>(
     builder.Configuration.GetSection(OutboxOptions.SectionName));
 
 builder.Services.AddScoped<ITaskDbRepository, TaskRepository>();
+builder.Services.AddScoped<OutboxLoadTestSeeder>();
 builder.Services.AddSingleton<ITaskPublisher, TaskPublisher>();
 builder.Services.AddHostedService<OutboxPublisherBackgroundService>();
 
@@ -91,6 +92,21 @@ app.MapPost("/tasks", async (
     }, ct);
 
     return Results.Created($"/tasks/{createdTaskId}", new { Id = createdTaskId });
+});
+
+app.MapPost("/outbox/load-test", async (
+    int? count,
+    OutboxLoadTestSeeder seeder,
+    CancellationToken ct) =>
+{
+    var messagesCount = Math.Clamp(count ?? 1000, 1, 10_000);
+    var created = await seeder.SeedAsync(messagesCount, ct);
+
+    return Results.Accepted(value: new
+    {
+        CompletedTasks = created,
+        OutboxMessages = created,
+    });
 });
 
 app.MapPut("/tasks/{id:guid}/complete", async (
